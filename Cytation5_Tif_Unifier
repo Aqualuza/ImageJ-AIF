@@ -1,0 +1,484 @@
+/*
+This is a macro to join images from the Cytation 5 imaging reader into more manageable files:
+It will join all files from each position in each well, so run this PER PLATE!
+
+This script works with:
+- Multiple channels
+- Z stacks
+- Multiple positions per well
+- Multiple wells
+- Timelapses
+
+Nomenclature for files coming from the Cytation 5
+E.g. 
+B2_02_SP10Z10_C1_Bright Field_T001.tif
+
+B2 - well
+02 - read step sequence (step in the procedure at which it took the image)
+SP10 - position 10
+Z10 - Z step 10
+C1 - channel 1
+T001 - timepoint 1
+
+Beware!
+The Cytation 5 does multiple positions in a specific manner. If you were doing a 3 x 3, it would be done as follows:
+X1Y3 -> X2Y3 -> X3Y3
+				  |
+				 \/
+X1Y2 <- X2Y2 <- X3Y2
+  |
+ \/
+X1Y1 -> X2Y1 -> X3Y1
+
+This would result in the folloiwing positions:
+SP1 - X1Y3
+SP2 - X2Y3
+SP3 - X3Y3
+SP4 - X3Y2
+SP5 - X2Y2
+SP6 - X1Y2
+SP7 - X1Y1
+SP8 - X2Y1
+SP9 - X3Y1
+
+Made with Fiji/ImageJ 2.14.0/1.54f, March 2024
+Made by Manuel Tanqueiro, Mariana Ferreira @ IGC
+*/
+
+// *** Debbugging and batch mode
+ShowAndTell = true; // For demonstration purposes, change to true, to wait in every major step for your input ! See Functions at the end of the Macro
+setBatchMode(true); // Batch mode says Fiji not to show the images to the user! Makes it faster to compute, but use with caution!!
+
+// *** Cleans work environment
+show_and_tell("Cleanup");
+cleanup(); // Function for cleaning up the workspace - check the end of the macro !
+
+// *** Check for needed plugins	and extensions
+show_and_tell("Plugins");
+run("Bio-Formats Macro Extensions");
+
+// *** Initialize and set constant parameters
+show_and_tell("Parameters and constants");
+channel_list = newArray(); // list of channels used
+file_list = newArray(); // list of all files in the directory to analyse
+file_list_Z = newArray(); // list of all files with Z steps, and separating the SP from the Z with an underscore
+file_list_Z_channel = newArray(); // list of all files with Z steps, and with the proper channel names
+empty = newArray(); // VERY IMPORTANT NOT TO MESS WITH THIS ONE - USED FOR LOGIC
+wells_in_use = newArray(); // list of all wells used
+first_files_names = newArray(); // list of the first file per position, per well, for bioformats importer
+bfimporter = newArray(); // first files named for bioformats import to import properly
+first_position = "_SP1"; // first position
+first_Z = "_Z0"; // first Z
+first_time = "_T001"; // first timepoint
+last_position = 1; // last position as default
+last_Z = 0; // last Z as default
+last_time = 1; // last timepoint as default
+list_files_wells = newArray(); // all files inside a well folder in the RAW_DATA directory
+index_floored = newArray(); // values to do the percentage of completion
+
+// *** Channels available for selection - can be updated upon new purchases
+show_and_tell("Channels for UI");
+channels_rows = 2; // Number of rows for the options on the channels
+channels_columns = 4; // Number of collumns for the options on the channels
+channels_names = newArray("DAPI", "GFP", "Texas Red", "RFP CY5", "Propidium Iodide", "Bright Field", "Colour Bright Field"); // channels available for selection
+channels_colours = newArray("Blue", "Green", "Red", "Magenta", "Red", "Grey", "Grey"); // colours to assign to each channel when doing composite - ------ WIP ------
+cn = lengthOf(channels_names); // Number of channels used
+channels_defaults = newArray(cn);
+rgb = newArray("Red", "Green", "Blue"); // colour names when using colour bright field
+rgb_colours = newArray("Red", "Green", "Blue"); // colours to assign for composite - colour brightfield - ------ WIP ------
+
+// *** Well plates for selection - can be updated
+show_and_tell("Well plates for UI");
+plates = newArray(1, 2, 6, 24, 96, 384); // size of plates available for selection
+plates_names = newArray("1", "2", "6", "24", "96", "384"); // for selecting which one was used
+plates_rows = newArray(1, 2, 2, 4, 8, 16); // rows per plate type
+plates_columns = newArray(1, 1, 3, 6, 12, 24); // columns per plate type
+cp = lengthOf(plates_names);
+alphabet = newArray("A", "B", "C", "D", "E", "F", "G", "H", "I" , "J", "K", "L", "M", "N", "O", "P");
+plate_used_rows_names = newArray();
+plate_used_columns_names = newArray();
+
+// *** User interface (UI)
+show_and_tell("UI (box and outputs)");
+Dialog.create("TIF unifier for the Agilent Cytation 5");
+Dialog.addMessage("Welcome to the TIF unifier for the Agilent Cytation 5 !");
+Dialog.addMessage("This Macro is going to take all the single TIF files the system outputs, and return them as one TIF per position. \n\nWhile doing so, it will rename your files. This means you cannot open them in Gen5 again !");
+Dialog.addMessage("It will start by saving all these single TIFs inside a folder called 'Joint_TIFs', organized by well. \n\nIt will also organize your raw data, in a master folder ('RAW_DATA'), organized by well.");
+Dialog.addMessage("After running the script, you can decide if you wish to MAINTAIN or ERASE the raw data.");
+Dialog.addMessage("BEWARE: maintaining both options will duplicate your data, meaning it will occupy twice the space necessary! \n\nPlan accordingly, and make sure you have a backup copy of the raw data if needed.");
+Dialog.addMessage("The Advanced Imaging Facility is not responsible if you erase your data by mistake !");
+Dialog.setInsets(15, 20, 0);
+Dialog.addDirectory("Start by selecting the folder where your images are located", ""); // where to find the data
+Dialog.addMessage("Which channels did you use?");
+Dialog.setInsets(15, 20, 0);
+Dialog.addCheckboxGroup(channels_rows, channels_columns, channels_names, channels_defaults); // get channels available
+Dialog.addMessage("What well plate did you use?");
+Dialog.setInsets(0, -330, 0);
+Dialog.addChoice("", plates_names, "96"); // plate used
+Dialog.addMessage("Were you using the slide holder? Select 2 wells");
+Dialog.addMessage("");
+Dialog.addMessage("This macro was made by Manuel Tanqueiro & Mariana Ferreira");
+Dialog.addMessage("Advanced Imaging Facility @ IGC, March 2024");
+Dialog.show();
+
+// *** Getting info from UI
+folder = Dialog.getString(); // Directory to find the data
+save_directory = folder + "RAW_DATA/"; // Creating directory
+final_directory = folder + "Joint_TIFs/";  // Creating directory
+File.makeDirectory(save_directory); // where the macro will save the raw data
+File.makeDirectory(final_directory); // where the macro will save the joint TIFs
+for (c = 0; c < cn; c++){ // Get channels used 
+	checkbox_check = Dialog.getCheckbox();
+	if (checkbox_check == 1){
+		channel_list = Array.concat(channel_list,channels_names[c]); // list of channels used
+	}
+}
+plate_used = Dialog.getChoice(); // Get plate used
+for (p = 0; p < cp; p++){
+	if (plate_used == plates[p]) { // find plate used to get all data about it
+		plate_used_rows = plates_rows[p]; // how many rows
+		for (r = 0; r < plate_used_rows; r++) {
+			plate_used_rows_names = Array.concat(plate_used_rows_names,alphabet[r]); // names of rows
+		}
+		plate_used_columns = plates_columns[p]; // how many columns
+		plate_used_columns_names = Array.getSequence(plate_used_columns); // names of columns
+	} 
+}
+
+// *** Changing the "Colour Bright Field" name in the list of channels to the proper channels ("Red", "Green", "Blue")
+show_and_tell("Colour Brightfield issue");
+nchannels = lengthOf(channel_list); // Number of channels used
+for (i = 0; i < nchannels; i++) {
+	if (channel_list[i] == "Colour Bright Field") { // Colour Bright Field is divided into 3 colours - Red, Green, Blue
+		channel_list = Array.deleteIndex(channel_list, i); // Delete name "Colour Bright Field" from channel list
+		channel_list = Array.concat(channel_list,rgb); // Add names "Red", "Green" and "Blue" to channel list
+		break;
+	}
+}
+
+// *** List of all files
+show_and_tell("List files");
+file_list_raw = getFileList(folder); // list of all files inside the folder given
+num_raw_files = lengthOf(file_list_raw); // How many raw files are there?
+for (f = 0; f < num_raw_files; f++){
+	if (endsWith(file_list_raw[f], ".tif")){ // Let's filter the data for .tif files, so that if we have anything else, it does not on these files
+		file_list = Array.concat(file_list_raw[f],file_list); // list of all files that are .tif, so that the macro can work on these alone 
+	}
+}
+
+// *** Check for Z and rename files
+show_and_tell("Check for Z's");
+print("\\Update1: Collecting information and renaming files");
+print("\\Update2:");
+print("\\Update3:");
+Z_check = Array.filter(file_list, "Z");  // check if there was a Z stack
+underscore_Z_check = Array.filter(file_list, "_Z.*_"); // if there were Z stacks, has this script been run before?
+SP_check = Array.filter(file_list, "SP"); // check if there were multiple positions
+if (lengthOf(underscore_Z_check) == lengthOf(empty)) {
+	if ((lengthOf(Z_check) != lengthOf(empty)) && (lengthOf(SP_check) != lengthOf(empty))) { // Z stack AND multiple positions
+		for (f = 0; f < lengthOf(file_list); f++) { 
+			file = File.getNameWithoutExtension(file_list[f]); 
+			file_withZ = replace(file_list[f], "Z", "_Z"); // The naming of the system does not separate positions from Z, so let's make it separate with an _
+			trash = File.rename(folder + file_list[f], folder + file_withZ);
+			file_list_Z = Array.concat(file_list_Z,file_withZ);
+		}
+	} 
+	else if ((lengthOf(Z_check) == lengthOf(empty)) && (lengthOf(SP_check) != lengthOf(empty))) { // just multiple positions
+		for (f = 0; f < lengthOf(file_list); f++) {
+			file_withZ = replace(file_list[f], "_C", "_Z0_C"); // If there are no Z in the acquision, add _Z0 to all files to make processing easier
+			trash = File.rename(folder + file_list[f], folder + file_withZ);
+			file_list_Z = Array.concat(file_list_Z, file_withZ);
+		}
+	}
+}
+
+// *** Check for channel and rename files
+show_and_tell("Remove channel names");
+channel_check = Array.filter(file_list_Z, channel_list[0]);
+if (lengthOf(channel_check) != lengthOf(empty)) {
+	for (f = 0; f < lengthOf(file_list_Z); f++) {
+		for (c = 0; c < lengthOf(channel_list); c++) {
+			file_without_channel = replace(file_list_Z[f], channel_list[c]+"_", ""); // Replace the name of the channels in the filename with nothing
+			trash = File.rename(folder + file_list_Z[f], folder + file_without_channel); // File.rename outputs something but we do not care, so let's assingn it to a variable to hide it
+			file_list_Z_channel = Array.concat(file_list_Z_channel,file_without_channel);
+		}
+	}
+}
+else {
+	file_list_Z_channel = file_list;
+}
+
+// *** Get a list of all wells, as well as the maximum positions, maximum Z and maximum timepoint 
+show_and_tell("Maximum positions, Z's and timepoints");
+for(f = 0; f < lengthOf(file_list_Z_channel); f++){
+	file = File.getNameWithoutExtension(file_list_Z_channel[f]);
+	split_filename = split(file, "_"); // Taking the names of the files, separate the different sections using _ as a separator
+	// --- list of all wells used
+	split_string = split_filename[0];
+	if (lengthOf(wells_in_use) == lengthOf(empty)) { // first time checking wells
+		wells_in_use = Array.concat(wells_in_use, split_string);
+		last_well = split_string; 
+	} else if ((lengthOf(wells_in_use) != lengthOf(empty)) && (last_well != split_string)) { // checking well against last that was checked 
+		wells_in_use = Array.concat(wells_in_use, split_string);
+		last_well = split_string;
+		}
+	for(x = 0; x < lengthOf(split_filename); x++){
+		split_string = split_filename[x];
+	
+		// --- check positions and find the last one
+		if ( split_string.contains("SP") ){
+			split_string = split_string.replace("SP","0"); // replace SP with 0, so that the name goes from SP06 to 006
+			split_parseint = parseInt(split_string); // convert into integers
+			last_position = Math.max(last_position, split_parseint); // find the maximum integer between the current position, and the last one checked
+		}
+		// --- check Z and find the last one
+		if ( split_string.contains("Z") ){
+			split_string = split_string.replace("Z","0"); // replace Z with 0, so that the name goes from Z06 to 006
+			split_parseint = parseInt(split_string); // convert into integers
+			last_Z = Math.max(last_Z, split_parseint); // find the maximum integer between the current Z, and the last one checked
+		}
+		// --- check T and find the last one
+		if ( split_string.contains("T") ){
+			split_string = split_string.replace("T","0"); // replace T with 0, so that the name goes from T006 to 0006
+			split_parseint = parseInt(split_string); // convert into integers
+			last_time = Math.max(last_time, split_parseint); // find the maximum integer between the current timepoint, and the last one checked
+		}
+	}
+}
+
+// *** For loop that will find the name of all first files for each position, at each well
+show_and_tell("First files");
+for (w = 0; w < lengthOf(wells_in_use); w++) {
+	well_name = wells_in_use[w];
+	for (sp = 1; sp < (last_position + 1); sp++) {
+		for(f = 0; f < lengthOf(file_list_Z_channel); f++) {
+			split_filename = split(file_list_Z_channel[f], "_"); // start by splitting the elements of the names
+			first_file_per_well_position = well_name + "_" + split_filename[1] + "_SP" + sp + first_Z + "_C1" + first_time + ".tif"; // Find the first file using variables created
+			first_file_bfimporter = well_name + "_" + split_filename[1] + "_SP" + sp + "_Z<0-" + last_Z  + ">_C<1-" + nchannels + ">_T<001-" + IJ.pad(last_time, 3) + ">.tif";
+			// We will open the files in BioFormats so let's create the name for it now
+			// Now we create an array with these files :
+			if (lengthOf(first_files_names) == lengthOf(empty)) { // Running for the first time
+				first_files_names = Array.concat(first_files_names, first_file_per_well_position); // First file is stored
+				bfimporter = Array.concat(bfimporter,first_file_bfimporter); 
+				last_checked = first_file_per_well_position; // save this to check with others
+			} else if (first_file_per_well_position != last_checked) { // is the first file the same as the last one checked? 
+				first_files_names = Array.concat(first_files_names, first_file_per_well_position); 
+				bfimporter = Array.concat(bfimporter,first_file_bfimporter);
+				last_checked = first_file_per_well_position;
+			}
+		}
+	}
+}
+
+// *** Provide some feedback on what the script found, while it is running
+show_and_tell("First feedback");
+print("\\Update4:You imaged " + lengthOf(wells_in_use) + " wells. These were:");
+Array.print(wells_in_use);
+if (last_position != 1) {
+	print("For each well you acquired " + last_position + " positions");
+}
+if (last_Z != 1) {
+	print("Each one with " + last_Z + 1 + " Z steps");
+}
+print("Using the following channels:");
+Array.print(channel_list);
+if (last_time != 1) {
+	print("And you imaged " + last_time + " timepoints");
+}
+
+// *** Create a folder for each well inside the RawData folder
+show_and_tell("Raw data organization");
+print("\\Update1: Creating directories and organising raw data"); //Update will create the line, and update it if it already existed ! More on this later
+print("\\Update2:");
+print("\\Update3:");
+for (w = 0; w < lengthOf(wells_in_use); w++) {
+	well_directory = save_directory + wells_in_use[w]+"/"; // Create the folders for FinalTIFs and RawData
+	File.makeDirectory(well_directory);
+	for (f = 0; f < lengthOf(file_list_Z_channel); f++) { // For all files in existance
+		if (startsWith(file_list_Z_channel[f], wells_in_use[w] + "_")) { // Find what folder they belong to
+			trash = File.rename(folder + file_list_Z_channel[f], well_directory + file_list_Z_channel[f]); // Copy and paste them to the correct place 
+		}
+	}
+}
+
+// *** Calculate the percentage of completion to give some feedback to the user - This is not pretty, but works ! It's a WIP...
+show_and_tell("Loading bar");
+maxpercent = lengthOf(first_files_names); // Depending on the number of files, we can run this in several ways !
+if (maxpercent < 10) { // Less than 10 files? Let's do 50% steps
+	// Take the total number of files, and create variables for the different steps of the loading bar depending on the file being processed
+	start = 0;
+	mid = maxpercent/2;
+	end = maxpercent-1;
+	index = newArray(start, mid, end);
+	percentage = newArray("0%", "50%", "100%");
+	bar = newArray("|____________________|", "|XXXXXXXXXX__________|", "|XXXXXXXXXXXXXXXXXXXX|");
+}
+else if (maxpercent < 20) { // Less than 20 files? Let's do 25% steps
+	// Take the total number of files, and create variables for the different steps of the loading bar depending on the file being processed
+	start = 0;
+	tfive = maxpercent/4;
+	mid = maxpercent/2;
+	sfive = tfive+mid;
+	end = maxpercent-1;
+	index = newArray(start, tfive, mid, sfive, end);
+	percentage = newArray("0%", "25%", "50%", "75%", "100%");
+	bar = newArray("|____________________|", "|XXXXX_______________|", "|XXXXXXXXXX__________|", "|XXXXXXXXXXXXXXX_____|", "|XXXXXXXXXXXXXXXXXXXX|");
+}
+else if (maxpercent < 100) { // Less than 100 files? Let's do 10% steps
+	// Take the total number of files, and create variables for the different steps of the loading bar depending on the file being processed
+	start = 0;
+	ten = maxpercent/10;
+	twenty = ten*2;
+	thirty = ten*3;
+	fourty = ten*4;
+	fifty = maxpercent/2;
+	sixty = fifty + ten;
+	seventy = fifty + twenty;
+	eighty = fifty + thirty;
+	ninety = fifty + fourty;
+	end = maxpercent-1;
+	index = newArray(start, ten, twenty, thirty, fourty, fifty, sixty, seventy, eighty, ninety, end);
+	percentage = newArray("0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%");
+	bar = newArray("|____________________|", "|XX__________________|", "|XXXX________________|", "|XXXXXX______________|", "|XXXXXXXX____________|", "|XXXXXXXXXX__________|", "|XXXXXXXXXXXX________|", "|XXXXXXXXXXXXXX______|", "|XXXXXXXXXXXXXXXX____|", "|XXXXXXXXXXXXXXXXXX__|", "|XXXXXXXXXXXXXXXXXXXX|");
+}
+else { // More than 100 files? Let's do every 5% steps
+	// Take the total number of files, and create variables for the different steps of the loading bar depending on the file being processed
+	start = 0;
+	five = maxpercent/20;
+	ten = maxpercent/10;
+	fifteen = ten + five;
+	twenty = ten*2;
+	tfive = maxpercent/4;
+	thirty = ten*3;
+	thirtyfive = thirty + five;
+	fourty = ten*4;
+	ffive = fourty + five;
+	fifty = maxpercent/2;
+	fiftyfive = fifty + five;
+	sixty = fifty + ten;
+	sixtyfive = sixty + five;
+	seventy = fifty + twenty;
+	sfive = fifty + tfive;
+	eighty = fifty + thirty;
+	efive = eighty + five;
+	ninety = fifty + fourty;
+	nfive = ninety + five;
+	end = maxpercent-1;
+	index = newArray(start, five, ten, fifteen, twenty, tfive, thirty, thirtyfive, fourty, ffive, fifty, fiftyfive, sixty, sixtyfive, seventy, sfive, eighty, efive, ninety, nfive, end);
+	percentage = newArray("0%", "5%", "10%", "15%", "20%", "25%", "30%", "35%", "40%", "45%", "50%", "55%", "60%", "65%", "70%", "75%", "80%", "85%", "90%", "95%", "100%");
+	bar = newArray("|____________________|", "|X___________________|", "|XX__________________|", "|XXX_________________|", "|XXXX________________|", "|XXXXX_______________|", "|XXXXXX______________|", "|XXXXXXX_____________|", "|XXXXXXXX____________|", "|XXXXXXXXX___________|", "|XXXXXXXXXX__________|", "|XXXXXXXXXXX_________|", "|XXXXXXXXXXXX________|", "|XXXXXXXXXXXXX_______|", "|XXXXXXXXXXXXXX______|", "|XXXXXXXXXXXXXXX_____|", "|XXXXXXXXXXXXXXXX____|", "|XXXXXXXXXXXXXXXXX___|", "|XXXXXXXXXXXXXXXXXX__|", "|XXXXXXXXXXXXXXXXXXX_|", "|XXXXXXXXXXXXXXXXXXXX|");
+}
+for (p = 0; p < lengthOf(index); p++) { // Turn values to integers, so that once we are running the Macro, the loading bar changes in whole numbers - files
+	whole_number = floor(index[p]); // Get a number, make it integer
+	index_floored = Array.concat(index_floored, whole_number); // Concatenate all whole numbers
+}
+
+// *** For loop that will go to all first files of each position and well, and use Bio-Formats Importer on it to join them
+show_and_tell("Bioformats Importer");
+for (ff = 0; ff < lengthOf(first_files_names); ff++) { // Cycle through the files
+	for (p = 0; p < lengthOf(index_floored); p++) { // Check for the loading bar
+		if (index_floored[p] == ff) {
+			print("\\Update2: " + bar[p] + "      " + percentage[p]); // Update loading bar if needed
+		}
+	}
+	for (w = 0; w < lengthOf(wells_in_use); w++) { // Go through files per well
+		well_directory_final = final_directory + wells_in_use[w]+"/"; // Create directory for output folder per well
+		File.makeDirectory(well_directory_final); // Create a folder based on the directory
+		if (startsWith(first_files_names[ff], wells_in_use[w] + "_")) { // Go to the first file of the position
+			print("\\Update1: Currently processing file: " + first_files_names[ff]); // Tell user what file its processing
+			well_directory = save_directory + wells_in_use[w]+"/"; // Where to find the file
+			run("Bio-Formats Importer", "open=[" + well_directory + first_files_names[ff] + "] color_mode=Default group_files rois_import=[ROI manager] view=Hyperstack stack_order=XYCZT contains=[] name=[" + well_directory + bfimporter[ff] + "]");
+			// Open the file with bioformats importer and join the files together
+			saveAs("tiff", well_directory_final + first_files_names[ff] + "_jointTIF"); // Save the file in the respective folder
+			close();
+		}
+	}
+}
+
+// *** UI for raw_data deletion
+show_and_tell("Erase data section");
+Dialog.create("Would you like to erase raw data?");
+Dialog.addMessage("Would you like to erase the raw data?");
+Dialog.addMessage("");
+Dialog.addMessage("BEWARE: Once you check this box and continue, you cannot go back! Make sure you have a backup if needed.");
+Dialog.addMessage("The Advanced Imaging Facility will take no responsibility for your choice!");
+Dialog.addMessage("");
+Dialog.setInsets(15, 20, 0);
+Dialog.addCheckbox("By checking this box, you will erase your raw data", false);
+Dialog.show();
+
+erase_raw_data = Dialog.getCheckbox();
+if (erase_raw_data) {
+	print("\\Clear");
+	print("");
+	print("Erasing raw data...");
+	for (w = 0; w < lengthOf(wells_in_use); w++) { // Let's erase the data, that now is organized in folders! So let's go by well folder
+		well_directory = save_directory + wells_in_use[w]+"/"; 
+		list_files_wells = getFileList(well_directory);
+		for (f = 0; f < lengthOf(list_files_wells); f++) { // Go through all files
+			trash = File.delete(well_directory + list_files_wells[f]); // Delete the file
+		}
+		trash = File.delete(well_directory); // Delete the well folder
+	}
+	trash = File.delete(save_directory); // Delete the RawData folder
+}
+
+// *** IT'S DONE!
+show_and_tell ("Final messages and cleanup");
+run("Close All");
+close("Log");
+if (erase_raw_data) {
+	exit("Done! Your new TIF files are now in the folder 'Joint_TIFs'"); // If you erased the raw data, just gives you the location of the final files
+} else {
+	exit("Done! You can find your raw data and new TIF files in folders 'RAW_DATA' and 'Joint_TIFs', respectively !"); // If you kept the raw data, tells you where to find both
+}
+cleanup();
+
+// *** Functions
+function cleanup() {
+	run("Close All");
+	run("Clear Results");
+	close("Results");
+	close("ROI Manager");
+	print("\\Clear");
+	close("Log");
+}
+function show_and_tell(section_name) {
+	string = section_name;
+	if (ShowAndTell){
+	waitForUser("Explain the section - " + string);
+	}
+}
+
+/* Work in progress ! Loading bar in a function to make it prettier
+function LoadingBar(NumFiles; NumDivisions){
+	if (NumDivisions >= NumFiles) {
+		print("Unable to create loading bar. Check number of files and divisions");
+	}
+	else if (NumDivisions < NumFiles) {
+		lastDivision = NumDivisions-1;
+		for (n = 0; n < NumDivisions; n++){
+			if (n==0) {
+				
+			}
+			else if  (n==(lastDivision) {
+				
+			}
+			else {
+				
+			}
+		}
+	} 
+	return ();
+}
+*/
+
+// *** TO DO LIST
+/*
+ * - When combining the channels, merge them with colours
+ * 		. Already have the array for the colours of each channel
+ * - Function for the Loading bar, to make it prettier and easier to use in other macros
+ * 		. Started doing the function, with two inputs - Number of Files, and Number of Divisions (how many steps)
+ * 
+*/
+
